@@ -1,0 +1,35 @@
+#!/usr/bin/env sh
+# 커밋 메시지 형식 검사.
+#
+# 이 파일은 harness.toml 에서 생성된다. 직접 고치지 않는다 —
+# 태그와 제목 형식은 harness.toml 의 [commit] 이 갖고, `harness render` 가 이 파일을 다시 만든다.
+# 검사식과 아래 안내문이 같은 값에서 나오므로 둘이 어긋날 수 없다.
+#
+# 활성화: git config core.hooksPath script/githooks
+set -u
+root=$(git rev-parse --show-toplevel 2>/dev/null)
+msg=$(head -1 "$1")
+
+# 머지·리버트·수정 커밋은 git 이 메시지를 만드므로 통과
+case "$msg" in
+  "Merge "*|"Revert "*|fixup!*|squash!*) exit 0 ;;
+esac
+
+if printf '%s' "$msg" | grep -Eq '{{COMMIT_SUBJECT_RE}}'; then
+  exit 0
+fi
+
+if [ -n "$root" ] && [ -x "$root/script/usage-log.sh" ]; then
+  "$root/script/usage-log.sh" block commit-msg format || true
+fi
+
+cat >&2 <<'EOF'
+error: commit subject does not match the required form
+
+  expected  {{COMMIT_SUBJECT_FORM}}
+  example   {{COMMIT_SUBJECT_EXAMPLE}}
+  tags      {{COMMIT_TAGS_HUMAN}}
+
+help: every commit needs an issue number — create the issue first, then commit
+EOF
+exit 1

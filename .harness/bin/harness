@@ -1,0 +1,1154 @@
+#!/usr/bin/env python3
+"""harness — generate the AI development harness from one config, and block drift.
+
+Values live in `harness.toml` and project facts in `.ai/project/`. Everything else
+is generated from them, so there is exactly one place to change any given value.
+Generated files are never edited by hand: `render` overwrites them and `check`
+blocks commits that drift.
+
+When a new file becomes generated, add it to plan() — that function is the single
+place recording which config key reaches which file.
+
+Requires python3 3.11 or newer (tomllib).
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # 3.11 미만
+    sys.exit("python3 3.11 이상이 필요하다 (tomllib 없음). 현재: %s" % sys.version.split()[0])
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent                      # 하네스 리포 루트 또는 대상 리포의 .harness/
+TEMPLATES = ROOT / "templates"
+
+BANNER_SH = (
+    "# 이 파일은 harness.toml 에서 생성된다. 직접 고치지 않는다 —\n"
+    "# 값은 harness.toml 이 갖고, `harness render` 가 이 파일을 다시 만든다.\n"
+)
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 설정
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load(target: Path) -> dict:
+    p = target / "harness.toml"
+    if not p.is_file():
+        die("error: no config found\n  --> %s\n\nhelp: run `harness install` in this repository to create one" % p)
+    with p.open("rb") as f:
+        try:
+            return tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            die("error: could not parse config\n  --> %s\n\n  %s" % (p, e))
+
+
+def normalize(cfg: dict):
+    """설정을 소비자가 쓸 형태로 채운다. 읽은 직후 한 번만 돈다.
+
+    통합 브랜치는 보호 목록에 **자동으로 들어간다.** 거기로 직접 push 할 수 있으면 승인 게이트가
+    우회되므로 선택지가 아니고, 그렇다면 사람이 두 곳에 같은 이름을 적을 이유도 없다.
+    """
+    b = cfg["branches"]
+    if b["base"] not in b["protected"]:
+        b["protected"] = b["protected"] + [b["base"]]
+
+
+def vendor(cfg: dict, role: str) -> str:
+    """그 역할을 실제로 실행하는 쪽. inproc 은 오케스트레이터다."""
+    r = cfg["roles"][role]["runner"]
+    return cfg["harness"]["orchestrator"] if r == "inproc" else r
+
+
+def validate(cfg: dict):
+    c = cfg["commit"]
+    if c["issue_ref"] not in ("suffix", "prefix"):
+        die("error: commit.issue_ref must be `suffix` or `prefix` (got %r)" % c["issue_ref"])
+    if c["issue_ref"] == "prefix" and not c.get("ticket_key"):
+        die("error: commit.issue_ref = prefix requires commit.ticket_key\n\nhelp: set the ticket prefix your tracker uses\n        harness set commit.ticket_key BD")
+    if not c["tags"]:
+        die("error: commit.tags is empty — at least one tag is required")
+
+    for name, role in cfg["roles"].items():
+        if role["runner"] not in ("inproc", "claude", "codex"):
+            die("error: roles.%s.runner must be inproc, claude or codex (got %r)" % (name, role["runner"]))
+        if role["access"] not in ("read-only", "write"):
+            die("error: roles.%s.access must be read-only or write (got %r)" % (name, role["access"]))
+
+    if cfg.get("invariants", {}).get("distinct_reviewer", True):
+        dev, rev = vendor(cfg, "developer"), vendor(cfg, "code-reviewer")
+        if dev == rev:
+            die("error: developer and reviewer run on the same runner (%s)\n"
+                "\n"
+                "  A model reviewing its own output walks past the same blind spot twice,\n"
+                "  so the review adds nothing the implementation did not already assume.\n"
+                "\n"
+                "help: give the reviewer a different runner\n"
+                "        harness set roles.code-reviewer.runner <claude|codex>\n"
+                "\n"
+                "help: to accept this on purpose, opt out explicitly\n"
+                "        harness set invariants.distinct_reviewer false" % dev)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 파생 — 설정값에서 각 소비자가 쓰는 형태를 만든다
+# ─────────────────────────────────────────────────────────────────────────────
+
+TOOLS_BY_ACCESS = {
+    "read-only": ["Read", "Grep", "Glob"],
+    "write": ["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
+}
+
+
+def tools_of(role: dict) -> list:
+    return role.get("tools") or TOOLS_BY_ACCESS[role["access"]]
+
+
+def reviewer_cmd(cfg: dict):
+    """리뷰를 수행하는 명령과 등록 댓글에 표시할 이름."""
+    role = cfg["roles"]["code-reviewer"]
+    runner, model = role["runner"], role.get("model", "")
+    if runner == "codex":
+        cmd = ["codex", "exec", "--sandbox", "read-only", "--ephemeral"]
+        if model:
+            cmd += ["-m", model]
+        return " ".join(cmd), "Codex"
+    if runner == "claude":
+        cmd = ["claude", "-p", "--agent", "code-reviewer", "--no-session-persistence"]
+        if model:
+            cmd += ["--model", model]
+        return " ".join(cmd), "Claude"
+    # inproc — 스크립트가 띄우지 않는다. 오케스트레이터가 서브에이전트로 부른다.
+    return "", cfg["harness"]["orchestrator"].capitalize()
+
+
+FORGE_CLI = {"gitlab": "glab", "github": "gh", "jira": "jira"}
+
+
+def docs_regex(patterns: list) -> str:
+    """보호 문서 glob 을 가드가 쓰는 정규식 하나로. `docs/x/**` 는 그 아래 전부를 뜻한다."""
+    out = []
+    for g in patterns:
+        g = g.rstrip("*").rstrip("/") + ("/" if g.rstrip("*").endswith("/") or g.endswith("**") else "")
+        out.append(re.escape(g).replace("\\/", "/"))
+    return "|".join(out)
+
+
+def adr_procedure(style: str, tool: str, d: str) -> str:
+    """결정 기록을 만들고 대체하는 절차. **도구가 정하므로 문서에 적어 두지 않는다.**
+
+    도구를 바꿨는데 절차가 그대로면 없는 명령을 지시하게 된다.
+    """
+    if tool == "adr-tools":
+        return (
+            "| 하는 일 | 명령 |\n|---|---|\n"
+            '| 새 결정 만들기 | `adr new "<영문 제목>"` |\n'
+            '| 기존 결정 대체하기 | `adr new -s <기존번호> "<영문 제목>"` |\n'
+            "| 목록 | `adr list` |\n\n"
+            "- **제목은 영어로 준다.** 도구가 제목을 그대로 파일명으로 쓴다.\n"
+            "- **상태를 손으로 고치지 않는다.** 도구가 넣는 값을 그대로 둔다.\n"
+            "- 대체는 한 명령이지만 원자적이지 않다. 중간에 실패하면 새 문서와 기존 문서의 표기가\n"
+            "  어긋난 채 남으므로, 커밋 전에 작업 트리를 확인하고 필요하면 되돌린 뒤 다시 실행한다."
+        )
+    if tool == "adrs":
+        fmt = " --format madr" if style == "madr" else ""
+        return (
+            "| 하는 일 | 명령 |\n|---|---|\n"
+            '| 새 결정 만들기 | `adrs new%s "<영문 제목>"` |\n'
+            '| 기존 결정 대체하기 | `adrs new%s --supersedes <기존번호> "<영문 제목>"` |\n'
+            "| 목록 | `adrs list` |\n\n"
+            "- **제목은 영어로 준다.** 도구가 제목을 그대로 파일명으로 쓴다.\n"
+            "- **상태를 손으로 고치지 않는다.** 도구가 넣는 값을 그대로 둔다."
+        ) % (fmt, fmt)
+    where = "front matter 의 `status:` 한 줄" if style == "madr" else "`## Status` 절"
+    return (
+        "도구를 쓰지 않는다. 손으로 한다.\n\n"
+        "| 하는 일 | 어떻게 |\n|---|---|\n"
+        "| 새 결정 만들기 | `%s/templates/template.md` 를 `NNNN-title-with-dashes.md` 로 복사한다. "
+        "번호는 남은 파일의 최대 번호 + 1 |\n"
+        "| 기존 결정 대체하기 | 새 문서를 만들고, 기존 문서의 %s 만 대체 표기로 바꾼다 |\n"
+        "| 목록 | `ls %s` |\n\n"
+        "- **제목·파일명은 영어로 쓴다.** 본문은 프로젝트 문서 언어로.\n"
+        "- **대체할 때 고치는 것은 상태 한 줄뿐이다.** 본문도 날짜도 건드리지 않는다 —\n"
+        "  기록은 로그이고 틀린 결정도 그대로 남아야 한다."
+    ) % (d, where, d)
+
+
+def derive(cfg: dict) -> dict:
+    p, b, c, r = cfg["project"], cfg["branches"], cfg["commit"], cfg["review"]
+    i, m, f = cfg["issues"], cfg["mr"], cfg["forge"]
+    tags = "|".join(c["tags"])
+    cmd, label = reviewer_cmd(cfg)
+
+    if c["issue_ref"] == "suffix":
+        subject_re = r"^(%s): .+\(#[0-9]+\)$" % tags
+        subject_form = "<tag>: {summary}(#{issue})"
+        subject_example = "%s: short summary(#123)" % c["tags"][0]
+    else:
+        k = c["ticket_key"]
+        subject_re = r"^\[%s-[0-9]+\] (%s): .+$" % (k, tags)
+        subject_form = "[%s-{ticket}] <tag>: {summary}" % k
+        subject_example = "[%s-123] %s: short summary" % (k, c["tags"][0])
+
+    return {
+        "HARNESS_VERSION": cfg["harness"]["version"],
+        "PROJECT_NAME": p["name"],
+        "BASE_BRANCH": b["base"],
+        "PROTECTED_BRANCHES": " ".join(b["protected"]),
+        "PROTECTED_REF_CASE": "|".join("refs/heads/%s" % x for x in b["protected"]),
+        "PROTECTED_BRANCH_CASE": "|".join(b["protected"]),
+        "COMMIT_TAGS": tags,
+        "COMMIT_TAGS_HUMAN": " | ".join(c["tags"]),
+        "COMMIT_SUBJECT_RE": subject_re,
+        "COMMIT_SUBJECT_FORM": subject_form,
+        "COMMIT_SUBJECT_EXAMPLE": subject_example,
+        "BRANCH_PATTERN": "<tag>/<issue-number>-<english-summary>",
+        "REVIEW_MAX_ROUNDS": str(r["max_rounds"]),
+        "REVIEW_REPEAT_FILE_MAX": str(r["repeat_file_max"]),
+        "REVIEW_ROUND_LABEL": r["round_label"],
+        "REVIEWER_CMD": cmd,
+        "REVIEWER_LABEL": label,
+        "FORGE_TRACKER": f["tracker"],
+        "FORGE_REVIEW_HOST": f["review_host"],
+        "FORGE_TRACKER_CLI": FORGE_CLI.get(f["tracker"], f["tracker"]),
+        "FORGE_REVIEW_CLI": FORGE_CLI.get(f["review_host"], f["review_host"]),
+        "ISSUE_LABEL_TASK": i["labels"].get("task", ""),
+        "ISSUE_LABEL_REQUIREMENT": i["labels"].get("requirement", ""),
+        "ISSUE_LABEL_INVALID": i["labels"].get("invalid", ""),
+        "ISSUE_REQUIRED_FIELDS": " ".join(i["required_fields"]),
+        "ISSUE_DELETE_FORBIDDEN": "1" if i["deletion_forbidden"] else "0",
+        "ISSUE_DELETE_RULE": (
+            "이 프로젝트는 이슈 삭제를 **금지**한다. 잘못 만든 이슈는 `%s` 로\n"
+            "    닫힌 채 영구히 남는다 — 되돌릴 수 없으므로 만들기 전에 확인한다"
+            % i["labels"].get("invalid", "invalid")
+        ) if i["deletion_forbidden"] else (
+            "잘못 만든 이슈는 지울 수 있다. 그래도 빈 이슈를 만들지 않는다 —\n"
+            "    지우기 전까지 남아 있고, 지우면 그 번호를 가리키던 참조가 깨진다"
+        ),
+        "FORGE_CLIS": " ".join(dict.fromkeys(
+            [FORGE_CLI.get(f["tracker"], f["tracker"]),
+             FORGE_CLI.get(f["review_host"], f["review_host"])])),
+        "ISSUE_REF_DISPLAY": "#{id}" if c["issue_ref"] == "suffix" else "{id}",
+        "MR_DEFAULT_ASSIGNEE": m["default_assignee"],
+        "MR_DEFAULT_REVIEWER": m["default_reviewer"],
+        "PROTECTED_DOCS_RE": docs_regex(cfg["docs"]["protected"]),
+        # 가드 회귀 테스트가 "보호되는 경로 하나" 로 쓴다. 디렉터리면 그 아래 파일 하나를 만든다.
+        "PROTECTED_DOCS_SAMPLE": (lambda g: g if not g.endswith("/") else g + "sample.md")(
+            docs_regex(cfg["docs"]["protected"]).split("|")[0].replace("\\", "")),
+        "PROTECTED_DOCS_LIST": ", ".join("`%s`" % g for g in cfg["docs"]["protected"]),
+        "AGENT_TABLE": agent_table(cfg),
+        "AGENT_COUNT": str(len(cfg["roles"])),
+        "ADR_STYLE": cfg["adr"]["style"],
+        "ADR_TOOL": cfg["adr"]["tool"],
+        "ADR_DIR": cfg["adr"]["dir"],
+        "ADR_PROCEDURE": adr_procedure(cfg["adr"]["style"], cfg["adr"]["tool"], cfg["adr"]["dir"]),
+        "USAGE_LOG_PATH": cfg["usage"]["log_path"].replace("{project}", p["name"]),
+        "USAGE_ENV_VAR": cfg["usage"]["env_var"],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 생성물
+# ─────────────────────────────────────────────────────────────────────────────
+
+VAR = re.compile(r"\{\{([A-Z_]+)\}\}")
+INCLUDE = re.compile(r"^\{\{INCLUDE:(\S+)\}\}$", re.M)
+LEAD_COMMENT = re.compile(r"\A\s*<!--.*?-->\s*", re.S)
+
+
+def substitute(text: str, v: dict, where: str, target: Path = None) -> str:
+    """{{VAR}} 치환. {{INCLUDE:경로}} 는 대상 리포의 소유 파일 본문을 그 자리에 넣는다.
+
+    소유 파일을 참조가 아니라 본문으로 넣는 이유: 에이전트가 읽는 규칙 정본이 한 파일이어야
+    하고, 중첩 import 가 모든 하네스에서 따라가진다는 보장이 없다. 사람이 소유 파일을 고치고
+    render 를 잊으면 check 가 커밋을 막는다 — 어긋난 채로 지나가지 않는다.
+    """
+    if target is not None:
+        def pull(m):
+            p = target / m.group(1)
+            if not p.is_file():
+                die("error: included file is missing\n  --> %s\n  required by %s" % (p, where))
+            body = p.read_text(encoding="utf-8")
+            # 소유 파일 머리의 안내 주석은 그 파일을 고치는 사람에게 하는 말이다.
+            # 규칙 정본에 담으면 에이전트가 읽는 근거에 소음이 섞인다.
+            body = LEAD_COMMENT.sub("", body, count=1)
+            return body.strip()
+        text = INCLUDE.sub(pull, text)
+    missing = sorted({m for m in VAR.findall(text) if m not in v})
+    if missing:
+        die("error: unknown template variable(s): %s\n  --> %s" % (", ".join(missing), where))
+    return VAR.sub(lambda m: v[m.group(1)], text)
+
+
+def deny_rules(cfg: dict) -> list:
+    """보호 브랜치 push · force push · --no-verify · 기준 문서 수정."""
+    out = []
+    for br in cfg["branches"]["protected"]:
+        out += [
+            "Bash(git push origin %s)" % br,
+            "Bash(git push origin %s:*)" % br,
+            "Bash(git push -u origin %s)" % br,
+            "Bash(git push --set-upstream origin %s)" % br,
+            "Bash(git push origin HEAD:%s)" % br,
+            "Bash(git push*HEAD:refs/heads/%s*)" % br,
+            "Bash(git push*refs/heads/%s*)" % br,
+            "Bash(git push*:%s)" % br,
+        ]
+    out += [
+        "Bash(git push --force:*)",
+        "Bash(git push -f:*)",
+        "Bash(git push --force-with-lease:*)",
+        "Bash(git push origin --force:*)",
+        "Bash(git push origin -f:*)",
+        "Bash(git push origin +*)",
+        "Bash(git push --no-verify:*)",
+        "Bash(git push*--no-verify*)",
+        "Bash(git commit --no-verify:*)",
+        "Bash(git commit*--no-verify*)",
+        "Bash(git commit -n:*)",
+    ]
+    for doc in cfg["docs"]["protected"]:
+        for tool in ("Edit", "Write", "NotebookEdit"):
+            out.append("%s(%s)" % (tool, doc))
+    return out
+
+
+def settings_json(cfg: dict) -> str:
+    data = {
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "$CLAUDE_PROJECT_DIR/script/hooks/bash-guard.sh",
+                }],
+            }],
+        },
+        "permissions": {"deny": deny_rules(cfg)},
+    }
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+# 값 안의 $HOME 을 셸이 펼쳐야 하는 키. 나머지는 전부 리터럴로 인용한다 —
+# 정규식의 `$` 가 변수 확장으로 읽히면 검사식이 조용히 달라진다.
+SHELL_EXPANDS = {"USAGE_LOG_PATH"}
+
+
+def harness_env(v: dict) -> str:
+    lines = [BANNER_SH, "# 셸이 읽는 설정값. `. script/harness.env` 로 소스한다.\n"]
+    for k in sorted(v):
+        lines.append("%s=%s\n" % (k, shell_quote(v[k], expand=k in SHELL_EXPANDS)))
+    return "".join(lines)
+
+
+def shell_quote(s: str, expand: bool = False) -> str:
+    if s == "":
+        return '""'
+    if expand:
+        return '"%s"' % s.replace('\\', '\\\\').replace('"', r'\"').replace('`', r'\`')
+    if re.fullmatch(r"[A-Za-z0-9_./:=-]+", s):
+        return s
+    return "'%s'" % s.replace("'", "'\\''")
+
+
+def parse_frontmatter(text: str, where: str):
+    if not text.startswith("---\n"):
+        die("error: missing frontmatter\n  --> %s" % where)
+    end = text.find("\n---\n", 3)
+    if end < 0:
+        die("error: unterminated frontmatter\n  --> %s" % where)
+    meta = {}
+    for line in text[4:end].splitlines():
+        if not line.strip():
+            continue
+        k, _, val = line.partition(":")
+        meta[k.strip()] = val.strip()
+    return meta, text[end + 5:]
+
+
+def toml_str(s: str) -> str:
+    """TOML basic string. JSON 이스케이프와 호환된다."""
+    return json.dumps(s, ensure_ascii=False)
+
+
+def agent_table(cfg: dict) -> str:
+    """설정된 역할만으로 자산 표의 행을 만든다.
+
+    표를 손으로 적으면 역할을 지운 뒤에도 이름이 남아, 만들어지지 않은 파일을 가리킨다.
+    한 줄 설명은 어댑터 본문의 frontmatter `summary` 가 갖는다 — 설명과 본문이 같은 파일에 있다.
+    """
+    rows = []
+    for name in sorted(cfg["roles"]):
+        src = TEMPLATES / "agents" / ("%s.md" % name)
+        if not src.is_file():
+            die("error: no adapter body for role `%s`\n  --> %s" % (name, src))
+        meta, _ = parse_frontmatter(src.read_text(encoding="utf-8"), str(src))
+        if "summary" not in meta:
+            die("error: frontmatter has no `summary`\n  --> %s" % src)
+        rows.append("| `.claude/agents/%s.md` | %s |" % (name, meta["summary"]))
+    return "\n".join(rows)
+
+
+def agent_files(cfg: dict, v: dict) -> list:
+    """역할 어댑터. 본문은 하네스가 갖고 frontmatter 는 설정에서 나온다."""
+    out = []
+    for name in sorted(cfg["roles"]):
+        role = cfg["roles"][name]
+        src = TEMPLATES / "agents" / ("%s.md" % name)
+        if not src.is_file():
+            die("error: no adapter body for role `%s`\n  --> %s" % (name, src))
+        meta, body = parse_frontmatter(src.read_text(encoding="utf-8"), str(src))
+        if "description" not in meta:
+            die("error: frontmatter has no `description`\n  --> %s" % src)
+        body = substitute(body, v, str(src)).strip() + "\n"
+        if "'''" in body:
+            die("error: body contains \'\'\' — the TOML copy cannot be generated\n  --> %s" % src)
+
+        fm = ["---", "name: %s" % name, "description: %s" % meta["description"],
+              "tools: %s" % ", ".join(tools_of(role))]
+        if role.get("model"):
+            fm.append("model: %s" % role["model"])
+        sandbox = "read-only" if role["access"] == "read-only" else "workspace-write"
+        fm += ["codex_sandbox_mode: %s" % sandbox, "---", ""]
+        out.append((".claude/agents/%s.md" % name, "\n".join(fm) + "\n" + body, 0o644))
+
+        toml = [
+            "name = %s" % toml_str(name),
+            "description = %s" % toml_str(meta["description"]),
+            "sandbox_mode = %s" % toml_str(sandbox),
+        ]
+        if role.get("model"):
+            toml.append("model = %s" % toml_str(role["model"]))
+        toml.append("developer_instructions = '''\n%s'''" % body)
+        out.append((".codex/agents/%s.toml" % name, "\n".join(toml) + "\n", 0o644))
+    return out
+
+
+def forge_doc(cfg: dict, v: dict) -> str:
+    """`.ai/forge.md` — 사람과 에이전트가 읽는 forge 명령 사전.
+
+    **손으로 쓰지 않는다.** 손으로 쓴 사전은 실제 어댑터와 갈라져, 없는 플래그를 적은 채
+    남는다. 트래커와 리뷰 호스트가 다른 forge 여도 각자의 절이 제 자리에서 나온다.
+    """
+    f = cfg["forge"]
+    parts = [substitute((TEMPLATES / "forge" / "forge.md").read_text(encoding="utf-8"),
+                        v, "forge.md")]
+    for kind, frag in ((f["tracker"], "tracker.md"), (f["review_host"], "review.md")):
+        src = TEMPLATES / "forge" / kind / frag
+        if not src.is_file():
+            die("error: no command reference for this forge\n  --> %s\n\nhelp: check [forge] in harness.toml" % src)
+        parts.append(substitute(src.read_text(encoding="utf-8"), v, str(src)))
+    return "\n".join(p.strip() for p in parts) + "\n"
+
+
+def adr_files(cfg: dict, v: dict) -> list:
+    """ADR 스타일별 문서 세트. 스타일이 정하는 것은 문서뿐이고 절차는 바뀌지 않는다."""
+    style, tool, d = cfg["adr"]["style"], cfg["adr"]["tool"], cfg["adr"]["dir"]
+    base = TEMPLATES / "adr" / style
+    if not base.is_dir():
+        die("error: unknown adr.style `%s` (available: %s)"
+            % (style, ", ".join(sorted(p.name for p in (TEMPLATES / "adr").iterdir()))))
+    if style == "nygard" and tool not in ("adr-tools", "manual", "none"):
+        die("error: adr.style = nygard supports adr.tool adr-tools, manual or none (got %r)" % tool)
+    if style == "madr" and tool == "adr-tools":
+        die("error: adr.tool = adr-tools cannot be used with adr.style = madr\n"
+            "\n"
+            "  adr-tools locates status and supersede links by the `## Status` heading,\n"
+            "  which MADR does not have — it would silently do nothing.\n"
+            "\n"
+            "help: use the manual procedure with MADR\n"
+            "        harness set adr.tool manual")
+
+    out = [(".ai/adr.md", substitute((base / "adr.md").read_text(encoding="utf-8"),
+                                     v, str(base / "adr.md")), 0o644)]
+    if style == "none":
+        return out
+    out.append(("%s/README.md" % d,
+                substitute((base / "README.md").read_text(encoding="utf-8"),
+                           v, str(base / "README.md")), 0o644))
+    tpl = base / "template.md"
+    if tpl.is_file():
+        out.append(("%s/templates/template.md" % d,
+                    substitute(tpl.read_text(encoding="utf-8"), v, str(tpl)), 0o644))
+    if tool == "adr-tools":
+        # adr-tools 가 대상 디렉터리를 이 파일 하나로 읽는다.
+        out.append((".adr-dir", d + "\n", 0o644))
+    return out
+
+
+def plan(cfg: dict, target: Path = None) -> list:
+    """생성되는 파일 전부. (경로, 내용, 권한)"""
+    v = derive(cfg)
+    out = []
+
+    gen = TEMPLATES / "generated"
+    for src in sorted(gen.rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(gen).as_posix()
+        text = src.read_text(encoding="utf-8")
+        mode = 0o755 if os.access(src, os.X_OK) else 0o644
+        out.append((rel, substitute(text, v, str(src), target), mode))
+
+    out.append(("script/harness.env", harness_env(v), 0o644))
+    out.append((".claude/settings.json", settings_json(cfg), 0o644))
+    out.append((".ai/forge.md", forge_doc(cfg, v), 0o644))
+    out += adr_files(cfg, v)
+    out += agent_files(cfg, v)
+    return sorted(out)
+
+
+def copy_tree(src: Path, dst: Path, only_if_absent: bool, skip=None):
+    """관리 파일은 덮어쓰고, 소유 파일은 없을 때만 깐다. (바뀐 수, 깐 경로 전부)"""
+    n, paths = 0, []
+    for f in sorted(src.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(src).as_posix()
+        if skip and skip(rel):
+            continue
+        paths.append(rel)
+        out = dst / rel
+        if only_if_absent and out.exists():
+            continue
+        out.parent.mkdir(parents=True, exist_ok=True)
+        text = f.read_text(encoding="utf-8")
+        if out.is_file() and out.read_text(encoding="utf-8") == text:
+            continue
+        out.write_text(text, encoding="utf-8")
+        os.chmod(out, 0o755 if os.access(f, os.X_OK) else 0o644)
+        n += 1
+    return n, paths
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 명령
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 지난 render 가 무엇을 깔았는지. 설정이 바뀌어 더는 만들지 않는 파일을 지우는 근거이고,
+# 제거할 때 무엇이 하네스 것이고 무엇이 프로젝트 것인지 가르는 근거다.
+MANIFEST = ".harness/generated"
+MANIFEST_MANAGED = ".harness/managed"
+
+
+def previous(target: Path, name: str = MANIFEST) -> list:
+    p = target / name
+    return p.read_text(encoding="utf-8").split() if p.is_file() else []
+
+
+def prune(target: Path, keep: set, manifest: str) -> int:
+    """직전에 깔았으나 이번에는 만들지 않는 파일을 지운다. 빈 디렉터리도 함께 걷는다."""
+    n = 0
+    for rel in previous(target, manifest):
+        if rel in keep:
+            continue
+        stale = target / rel
+        if stale.is_file():
+            stale.unlink()
+            n += 1
+            for d in stale.parents:
+                if d == target or any(d.iterdir()):
+                    break
+                d.rmdir()
+    return n
+
+
+def cmd_render(cfg, target, _args):
+    # 소유 파일을 먼저 깐다 — 생성물이 그 본문을 포함할 수 있다.
+    owned, _ = copy_tree(TEMPLATES / "owned", target, only_if_absent=True)
+    # 쓰지 않는 역할의 계약은 깔지 않는다. 깔아 두면 설정에 없는 역할을 가리키는 문서가 남는다.
+    known = {f.stem for f in (TEMPLATES / "agents").glob("*.md")}
+    unused = known - set(cfg["roles"])
+    managed, managed_paths = copy_tree(
+        TEMPLATES / "managed", target, only_if_absent=False,
+        skip=lambda rel: rel.startswith(".ai/templates/")
+        and rel[len(".ai/templates/"):-len(".md")] in unused)
+
+    items = plan(cfg, target)
+    written = 0
+    for rel, content, mode in items:
+        p = target / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        old = p.read_text(encoding="utf-8") if p.is_file() else None
+        if old != content:
+            p.write_text(content, encoding="utf-8")
+            written += 1
+        os.chmod(p, mode)
+
+    # 설정이 바뀌면 만들던 파일이 빠진다. 남겨 두면 옛 forge 어댑터나 쓰지 않는 역할의 계약이
+    # 리포에 그대로 있어, 사람도 에이전트도 어느 쪽이 현재인지 알 수 없다.
+    made = {rel for rel, _c, _m in items}
+    removed = prune(target, made, MANIFEST) + prune(target, set(managed_paths), MANIFEST_MANAGED)
+
+    mf = target / MANIFEST
+    mf.parent.mkdir(parents=True, exist_ok=True)
+    mf.write_text("".join(rel + "\n" for rel in sorted(made)), encoding="utf-8")
+    (target / MANIFEST_MANAGED).write_text(
+        "".join(rel + "\n" for rel in sorted(managed_paths)), encoding="utf-8")
+
+    print("render: %d generated (%d updated, %d removed) · %d managed updated · %d owned created"
+          % (len(items), written, removed, managed, owned))
+    return 0
+
+
+def staged_text(target: Path, rel: str):
+    r = subprocess.run(["git", "-C", str(target), "show", ":%s" % rel],
+                       capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def cmd_check(cfg, target, args):
+    bad = []
+    items = plan(cfg, target)
+    made = {rel for rel, _c, _m in items}
+    for rel in previous(target):
+        if rel not in made and (target / rel).is_file():
+            bad.append((rel, "left over; the config no longer generates it"))
+    for rel, content, _mode in items:
+        if args.staged:
+            actual = staged_text(target, rel)
+        else:
+            p = target / rel
+            actual = p.read_text(encoding="utf-8") if p.is_file() else None
+        if actual is None:
+            bad.append((rel, "missing"))
+        elif actual != content:
+            bad.append((rel, "differs from the config"))
+    if bad:
+        print("error: generated files do not match the config%s"
+              % (" (staged contents)" if args.staged else ""), file=sys.stderr)
+        for rel, why in bad:
+            print("  %-52s %s" % (rel, why), file=sys.stderr)
+        print("\nhelp: regenerate them — never edit generated files by hand\n"
+              "        harness render", file=sys.stderr)
+        return 1
+    print("check: %d generated files match the config" % len(items))
+    return 0
+
+
+def cmd_vars(cfg, _target, _args):
+    for k, val in sorted(derive(cfg).items()):
+        print("%-24s %s" % (k, val))
+    return 0
+
+
+def seed_config(target: Path):
+    """설정이 없는 대상에 기본 설정을 깔고 프로젝트 이름만 채운다."""
+    dst = target / "harness.toml"
+    if dst.exists():
+        return
+    text = (ROOT / "harness.toml").read_text(encoding="utf-8")
+    dst.write_text(text.replace('name = "my-project"', 'name = "%s"' % target.name),
+                   encoding="utf-8")
+    print("created %s — review the values, then run `harness render`" % dst)
+
+
+def cmd_install(cfg, target, _args):
+    dst = target / ".harness"
+    if dst.exists():
+        shutil.rmtree(dst)
+    (dst / "bin").mkdir(parents=True)
+    shutil.copy2(HERE / "harness", dst / "bin" / "harness")
+    shutil.copytree(TEMPLATES, dst / "templates")
+    (dst / "VERSION").write_text(cfg["harness"]["version"] + "\n", encoding="utf-8")
+    print("install: %s (harness %s)" % (dst, cfg["harness"]["version"]))
+    return cmd_render(cfg, target, _args)
+
+
+
+# 설정에 적는 이름과 설치되는 실행 파일 이름이 다른 도구.
+ADR_EXE = {"adr-tools": "adr"}
+
+
+def hooks_path(target: Path):
+    r = subprocess.run(["git", "-C", str(target), "config", "core.hooksPath"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def cmd_uninstall(_cfg, target, args):
+    """하네스가 깐 것만 지운다. 프로젝트가 쓴 것은 남긴다.
+
+    소유 파일(`.ai/project/`·`script/verify-project.sh`·`docs/spec/README.md`)과 설정,
+    그리고 명세·분해·결정 기록 같은 작업 산출물은 **사람이 쓴 것이라 지우지 않는다.** `--purge` 를 줘야 소유 파일과
+    설정까지 지운다 — 그건 되돌릴 수 없으므로 따로 켠다.
+    """
+    gen = previous(target, MANIFEST)
+    man = previous(target, MANIFEST_MANAGED)
+    if not gen and not man:
+        die("error: no harness manifest at %s\n\n  Nothing was installed here, or it has already been removed." % MANIFEST)
+
+    removed, kept = [], []
+    for rel in sorted(set(gen) | set(man)):
+        f = target / rel
+        if f.is_file():
+            f.unlink()
+            removed.append(rel)
+
+    if args.purge:
+        for rel in sorted(p.relative_to(TEMPLATES / "owned").as_posix()
+                          for p in (TEMPLATES / "owned").rglob("*") if p.is_file()):
+            f = target / rel
+            if f.is_file():
+                f.unlink()
+                removed.append(rel)
+        for rel in ("harness.toml",):
+            f = target / rel
+            if f.is_file():
+                f.unlink()
+                removed.append(rel)
+    else:
+        for rel in sorted(p.relative_to(TEMPLATES / "owned").as_posix()
+                          for p in (TEMPLATES / "owned").rglob("*") if p.is_file()):
+            if (target / rel).is_file():
+                kept.append(rel)
+        if (target / "harness.toml").is_file():
+            kept.append("harness.toml")
+
+    shutil.rmtree(target / ".harness", ignore_errors=True)
+
+    # 훅 설정이 사라진 디렉터리를 가리키면 커밋할 때마다 git 이 실패한다.
+    if hooks_path(target) == "script/githooks":
+        subprocess.run(["git", "-C", str(target), "config", "--unset", "core.hooksPath"],
+                       capture_output=True)
+        print("  unset core.hooksPath (it pointed at a directory that is now gone)")
+
+    # 하네스가 만든 빈 디렉터리를 정리한다. 작업 산출물이 남아 있으면 그대로 둔다.
+    for d in sorted((target / p).parent for p in removed):
+        while d != target and d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+            d = d.parent
+
+    print("uninstall: removed %d files" % len(removed))
+    if kept:
+        print("\nkept — these are yours, not the harness's (use --purge to remove them too):")
+        for rel in kept:
+            print("  %s" % rel)
+    leftovers = [d for d in ("docs/spec", "docs/plan", cfg_adr_dir(target)) if d and (target / d).is_dir()]
+    if leftovers:
+        print("\nuntouched work output: %s" % ", ".join(leftovers))
+    return 0
+
+
+def cfg_adr_dir(target: Path):
+    """설정이 이미 지워졌을 수 있으므로 없으면 조용히 넘어간다."""
+    p = target / "harness.toml"
+    if not p.is_file():
+        return ""
+    try:
+        with p.open("rb") as f:
+            return tomllib.load(f).get("adr", {}).get("dir", "")
+    except Exception:
+        return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 참조 검사
+#
+# 하네스 문서가 사람에게 시키던 grep 을 여기로 옮긴다. 문서에 적힌 검사는
+# 아무도 돌리지 않는다 — 검사는 명령이 갖고, 문서는 그 명령을 부른다.
+
+SCAN_DIRS = (".ai", ".claude", ".codex", "script", "docs")
+SCAN_ROOTS = ("CLAUDE.md", "AGENTS.md", "README.md", "harness.toml")
+SCAN_SUFFIX = {".md", ".sh", ".json", ".toml", ".yml", ".yaml", ".py", ""}
+
+# 백틱 안의 리포 경로. 자리표시자(`<이슈>`·`*`·`{}`)가 섞인 것은 실재를 물을 수 없다.
+REF_RE = re.compile(r"`([^`\s]+)`")
+REF_PREFIX = (".ai/", ".claude/", ".codex/", "script/", "docs/")
+REF_SUFFIX = (".md", ".sh", ".json", ".toml", ".yml", ".yaml", ".py")
+REF_SKIP = set("<>*{}|()[]…")
+
+# 하네스가 문서에 적지만 만들지는 않는 파일. 없는 것이 정상이라 끊긴 참조가 아니다.
+# git 이 무시하는 경로도 같이 빠지지만, 그쪽은 리포가 git 일 때만 판정된다.
+REF_OPTIONAL = {".claude/settings.local.json"}
+
+
+def scan_files(target):
+    """참조를 찾을 파일. 생성·관리·소유를 가리지 않고 리포가 읽는 텍스트 전부."""
+    for d in SCAN_DIRS:
+        base = target / d
+        if base.is_dir():
+            for f in sorted(base.rglob("*")):
+                if f.is_file() and f.suffix in SCAN_SUFFIX:
+                    yield f
+    for n in SCAN_ROOTS:
+        f = target / n
+        if f.is_file():
+            yield f
+
+
+def ref_paths(text):
+    """본문이 실재를 주장하는 리포 경로만 낸다."""
+    for tok in REF_RE.findall(text):
+        if REF_SKIP & set(tok) or "://" in tok:
+            continue
+        if not tok.startswith(REF_PREFIX) or not tok.endswith(REF_SUFFIX):
+            continue
+        yield tok
+
+
+def dangling_roles(cfg, target):
+    """설정에 없는 역할을 아직 부르는 자리. 역할을 지우고 참조를 남기면 없는 것을 부른다."""
+    known = {f.stem for f in (TEMPLATES / "agents").glob("*.md")}
+    gone = sorted(known - set(cfg["roles"]))
+    out = []
+    for name in gone:
+        for f in scan_files(target):
+            for i, ln in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if name in ln:
+                    out.append((name, f.relative_to(target).as_posix(), i))
+                    break
+    return out
+
+
+def git_ignored(target, paths):
+    """git 이 무시하는 경로. 개인 설정처럼 없는 것이 정상인 파일을 결과에서 뺀다."""
+    if not paths:
+        return set()
+    try:
+        r = subprocess.run(["git", "check-ignore", "--stdin"], cwd=target,
+                           input="\n".join(paths), capture_output=True, text=True)
+    except OSError:
+        return set()
+    return set(r.stdout.split())
+
+
+def broken_refs(target):
+    """문서가 가리키는데 없는 파일. 문서가 언급하는 파일은 실재해야 한다."""
+    out = []
+    for f in scan_files(target):
+        if f.suffix != ".md":
+            continue
+        for tok in dict.fromkeys(ref_paths(f.read_text(encoding="utf-8", errors="replace"))):
+            if tok not in REF_OPTIONAL and not (target / tok).exists():
+                out.append((f.relative_to(target).as_posix(), tok))
+    skip = git_ignored(target, sorted({t for _, t in out}))
+    return [(rel, tok) for rel, tok in out if tok not in skip]
+
+
+def cmd_doctor(cfg, target, _args):
+    """쓸 준비가 됐는지 본다. 설정 자체는 여기 오기 전에 이미 검증됐다."""
+    v = derive(cfg)
+    bad = warn = 0
+
+    def line(state, what, detail=""):
+        nonlocal bad, warn
+        mark = {"ok": "  ok  ", "warn": "  warn", "bad": "  FAIL"}[state]
+        bad += state == "bad"
+        warn += state == "warn"
+        print("%s %s%s" % (mark, what, ("  — " + detail) if detail else ""))
+
+    print("config")
+    line("ok", "harness.toml is valid")
+    line("ok", "developer (%s) differs from reviewer (%s)"
+          % (vendor(cfg, "developer"), vendor(cfg, "code-reviewer")))
+
+    print("\ngenerated files")
+    items = plan(cfg, target)
+    stale = [r for r in previous(target) if r not in {x[0] for x in items} and (target / r).is_file()]
+    diff = [r for r, c, _m in items
+            if not (target / r).is_file() or (target / r).read_text(encoding="utf-8") != c]
+    if diff or stale:
+        line("bad", "%d files differ from the config" % (len(diff) + len(stale)),
+             "run `harness render`")
+    else:
+        line("ok", "%d files match the config" % len(items))
+
+    print("\nproject facts")
+    for rel in sorted(p.relative_to(TEMPLATES / "owned").as_posix()
+                      for p in (TEMPLATES / "owned").rglob("*") if p.is_file()):
+        f = target / rel
+        if not f.is_file():
+            line("bad", rel, "missing")
+            continue
+        n = f.read_text(encoding="utf-8").count("TBD")
+        if rel.endswith("verify-project.sh"):
+            r = subprocess.run(["sh", str(f)], capture_output=True, cwd=target)
+            line("ok" if r.returncode == 0 else "bad", rel,
+                 "" if r.returncode == 0 else "verification does not pass yet")
+        elif n:
+            line("warn", rel, "%d placeholder(s) still to fill" % n)
+        else:
+            line("ok", rel)
+
+    print("\nreferences")
+    dr = dangling_roles(cfg, target)
+    if dr:
+        for name, rel, ln in dr:
+            line("warn", "role `%s` is not in harness.toml" % name,
+                 "still referenced at %s:%d" % (rel, ln))
+    else:
+        line("ok", "every role reference resolves to a configured role")
+    br = broken_refs(target)
+    if br:
+        for rel, tok in br[:10]:
+            line("warn", "`%s` does not exist" % tok, "referenced by %s" % rel)
+        if len(br) > 10:
+            line("warn", "%d more broken path reference(s)" % (len(br) - 10))
+    else:
+        line("ok", "every path a document names exists")
+
+    print("\ntools and connections")
+    for cli in v["FORGE_CLIS"].split():
+        line("ok" if shutil.which(cli) else "bad", "forge CLI `%s`" % cli,
+             "" if shutil.which(cli) else "not installed")
+    for kind in dict.fromkeys([cfg["forge"]["tracker"], cfg["forge"]["review_host"]]):
+        a = target / "script" / "forge" / ("%s.sh" % kind)
+        if not a.is_file():
+            line("bad", "adapter `%s`" % kind, "file is missing")
+        elif "미검증" in a.read_text(encoding="utf-8"):
+            line("warn", "adapter `%s`" % kind,
+                 "unverified — run `script/forge-selftest.sh`")
+        else:
+            line("ok", "adapter `%s`" % kind)
+    if cfg["adr"]["tool"] not in ("manual", "none"):
+        t = cfg["adr"]["tool"]
+        exe = ADR_EXE.get(t, t)
+        line("ok" if shutil.which(exe) else "warn", "decision-record tool `%s`" % t,
+             "" if shutil.which(exe) else "`%s` is not installed" % exe)
+
+    print("\ngit")
+    hp = hooks_path(target)
+    line("ok" if hp == "script/githooks" else "bad", "git hooks enabled",
+         "" if hp == "script/githooks" else "run `git config core.hooksPath script/githooks`")
+
+    print()
+    sys.stdout.flush()
+    if bad:
+        print("%d failing · %d warning — not ready to use" % (bad, warn))
+        return 1
+    if warn:
+        print("%d warning(s) — usable, with open items" % warn)
+        return 0
+    print("all checks passed — ready to use")
+    return 0
+
+
+# 설정에 넣을 수 있는 값의 형태. TOML 을 다시 쓰지 않고 그 줄만 바꾼다.
+def toml_value(raw: str) -> str:
+    if raw in ("true", "false"):
+        return raw
+    if re.fullmatch(r"-?[0-9]+", raw):
+        return raw
+    if "," in raw:
+        return "[%s]" % ", ".join('"%s"' % x.strip() for x in raw.split(",") if x.strip())
+    return '"%s"' % raw
+
+
+def cmd_set(_cfg, target, args):
+    """`harness set <절.키> <값>` — 설정 한 줄을 바꾸고 다시 렌더한다.
+
+    사람이 TOML 을 직접 고쳐도 되지만, 고친 뒤 render 를 잊으면 검사가 커밋을 막는다.
+    한 명령으로 묶어 그 사이가 벌어지지 않게 한다.
+    """
+    if len(args.args) != 2:
+        die("usage: harness set <section.key> <value>\n\nexample: harness set branches.base develop")
+    dotted, raw = args.args
+    if "." not in dotted:
+        die("error: key must be `<section>.<name>` (got %r)" % dotted)
+    section, key = dotted.rsplit(".", 1)
+
+    p = target / "harness.toml"
+    original = p.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+    want = "[%s]" % section
+    inside = False
+    hit = None
+    for i, ln in enumerate(lines):
+        st = ln.strip()
+        if st.startswith("[") and st.endswith("]"):
+            inside = st == want
+            continue
+        if inside and re.match(r"%s\s*=" % re.escape(key), st):
+            hit = i
+            break
+    if hit is None:
+        die("error: no such key `%s` in the config\n  --> %s\n\nhelp: open the file and check the section and key name" % (dotted, p))
+
+    before = lines[hit].rstrip("\n")
+    lines[hit] = "%s = %s\n" % (key, toml_value(raw))
+    p.write_text("".join(lines), encoding="utf-8")
+
+    # 바꾼 값이 성립하지 않으면 되돌린다. 깨진 설정을 남기면 다음 명령이 전부 막힌다.
+    try:
+        cfg = load(target)
+        normalize(cfg)
+        validate(cfg)
+    except SystemExit:
+        p.write_text(original, encoding="utf-8")
+        print("\nreverted — the config is unchanged", file=sys.stderr)
+        return 2
+
+    print("set: %s" % before.strip())
+    print("  to %s" % lines[hit].strip())
+    return cmd_render(cfg, target, args)
+
+
+def cmd_run(cfg, target, args):
+    """`harness run <워크플로> <이슈>` — 설정된 오케스트레이터로 절차를 시작한다.
+
+    절차는 사람이 승인하는 지점에서 멈추므로 **대화형으로 띄운다.** 비대화형으로 돌리면
+    그 게이트가 통과된 것처럼 지나간다.
+    """
+    if len(args.args) != 2:
+        die("usage: harness run <workflow> <issue>\n\nexample: harness run work 12")
+    name, issue = args.args
+    wf = target / ".ai" / "workflows" / ("%s.md" % name)
+    if not wf.is_file():
+        avail = sorted(p.stem for p in (target / ".ai" / "workflows").glob("*.md"))
+        die("error: no such workflow `%s` (available: %s)"
+            % (name, ", ".join(avail) or "none"))
+
+    who = cfg["harness"]["orchestrator"]
+    if who == "claude":
+        cmd = ["claude", "/%s %s" % (name, issue)]
+    else:
+        cmd = [who, "이 리포의 .ai/workflows/%s.md 절차를 이슈 %s 에 대해 수행한다. "
+                    "그 파일을 먼저 읽고 그대로 따른다. 규칙 정본은 .ai/AI_AGENT.md 다. "
+                    "사람이 승인하는 지점에서는 멈추고 묻는다." % (name, issue)]
+    if not shutil.which(cmd[0]):
+        die("error: orchestrator `%s` is not installed\n\nhelp: install it, or point harness.orchestrator at one you have\n        harness set harness.orchestrator <claude|codex>" % cmd[0])
+    if args.dry_run:
+        print(" ".join(repr(c) if " " in c else c for c in cmd))
+        return 0
+    os.chdir(target)
+    os.execvp(cmd[0], cmd)
+
+
+COMMANDS = {
+    # 이름          (함수, 설정이 필요한가, 인수, 설명)
+    "install":   (None, True,  "[--target DIR]", "vendor the harness into .harness/ and render"),
+    "render":    (None, True,  "[--target DIR]", "harness.toml + .ai/project/ -> generated files"),
+    "check":     (None, True,  "[--staged]", "verify generated files match the config"),
+    "doctor":    (None, True,  "", "report readiness: config, files, tools, hooks"),
+    "set":       (None, True,  "<section.key> <value>", "change one config value and re-render"),
+    "run":       (None, True,  "<workflow> <issue>", "start a workflow in the configured orchestrator"),
+    "vars":      (None, True,  "", "print template variables (debugging)"),
+    "uninstall": (None, False, "[--purge]", "remove what the harness installed; --purge also removes yours"),
+    "version":   (None, False, "", "version of this harness"),
+    "help":      (None, False, "", "this help"),
+}
+
+
+def cmd_version(_cfg, target, _args):
+    with (ROOT / "harness.toml").open("rb") as f:
+        print("harness %s" % tomllib.load(f)["harness"]["version"])
+    v = target / ".harness" / "VERSION" if target else None
+    if v and v.is_file():
+        print("pinned in this project: %s" % v.read_text(encoding="utf-8").strip())
+    return 0
+
+
+def cmd_help(_cfg, _target, _args):
+    print(__doc__.strip().splitlines()[0])
+    print()
+    for name, (_f, _n, usage, desc) in COMMANDS.items():
+        print("  harness %-10s %-22s %s" % (name, usage, desc))
+    print()
+    print("  --target DIR   target repository (default: current directory)")
+    print()
+    print("Values live in the target repo's harness.toml; project facts in .ai/project/.")
+    print("Generated files are never edited by hand — render overwrites them and check")
+    print("blocks commits that drift.")
+    return 0
+
+
+# 전역 CLI 를 깔아도 각 프로젝트는 자기가 고정한 버전으로 돌아야 한다. 그러지 않으면
+# 전역을 올리는 순간 모든 프로젝트의 생성물이 조용히 바뀌고, 그 리포의 검사가 한꺼번에 깨진다.
+DELEGATES = {"render", "check", "doctor", "set", "run", "vars", "uninstall"}
+
+
+def delegate(target: Path, command: str):
+    """대상 리포에 고정된 하네스가 있으면 그쪽으로 넘긴다.
+
+    `install` 은 넘기지 않는다 — 고정된 사본을 갈아 끼우는 것이 그 명령의 일이다.
+    """
+    if command not in DELEGATES:
+        return
+    local = target / ".harness" / "bin" / "harness"
+    if not local.is_file() or local.resolve() == Path(__file__).resolve():
+        return
+    here = (ROOT / "harness.toml")
+    mine = there = ""
+    try:
+        with here.open("rb") as f:
+            mine = tomllib.load(f)["harness"]["version"]
+        there = (target / ".harness" / "VERSION").read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    if mine and there and mine != there:
+        print("note: this project is pinned to harness %s (global is %s) — delegating to it\n"
+              "      to upgrade the project, run: harness install --target %s"
+              % (there, mine, target), file=sys.stderr)
+    os.execv(sys.executable, [sys.executable, str(local)] + sys.argv[1:])
+
+
+def main():
+    handlers = {"install": cmd_install, "render": cmd_render, "check": cmd_check,
+                "doctor": cmd_doctor, "set": cmd_set, "run": cmd_run, "vars": cmd_vars,
+                "uninstall": cmd_uninstall, "version": cmd_version, "help": cmd_help}
+
+    ap = argparse.ArgumentParser(prog="harness", add_help=False,
+                                 description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", nargs="?", default="help", choices=list(COMMANDS))
+    ap.add_argument("args", nargs="*")
+    ap.add_argument("--target", default=".", help="target repository (default: current directory)")
+    ap.add_argument("--staged", action="store_true", help="check against staged contents")
+    ap.add_argument("--purge", action="store_true", help="uninstall: also remove owned files and the config")
+    ap.add_argument("--dry-run", action="store_true", help="run: print the command instead of executing it")
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args()
+    if args.help:
+        args.command = "help"
+
+    if args.command == "help":
+        return cmd_help(None, None, args)
+
+    target = Path(args.target).resolve()
+    # 하네스 리포 자신에게 쓰면 남의 프로젝트 설정으로 생성물이 깔린다.
+    # 설치된 리포에서는 ROOT 가 `<대상>/.harness` 라 이 조건에 걸리지 않는다.
+    if target == ROOT and (ROOT / "templates").is_dir():
+        die(
+            "error: refusing to run `%s` in the harness source repository\n"
+            "  --> %s\n"
+            "\n"
+            "  `harness.toml` here is the default template that `harness install` copies\n"
+            "  into a target repository. It is not this repository's own configuration,\n"
+            "  so rendering here would write generated files that belong to no project.\n"
+            "\n"
+            "help: to set up a project, run this inside that project\n"
+            "        cd <path/to/project> && harness install\n"
+            "      or point at it explicitly\n"
+            "        harness install --target <path/to/project>\n"
+            "\n"
+            "help: to exercise the harness itself, run its own test suite\n"
+            "        test/render-test.sh"
+            % (args.command, ROOT / "harness.toml"))
+    delegate(target, args.command)
+
+    cfg = None
+    if COMMANDS[args.command][1]:
+        if args.command == "install":
+            seed_config(target)
+        cfg = load(target)
+        normalize(cfg)
+        validate(cfg)
+    return handlers[args.command](cfg, target, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
