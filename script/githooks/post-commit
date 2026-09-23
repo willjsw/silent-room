@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+# 커밋 생성 직후 검증을 1회 실행한다. 커밋은 이미 만들어졌으므로 결과는 보고용이다.
+#
+# 이 파일은 harness.toml 에서 생성된다. 직접 고치지 않는다.
+#
+# 활성화: git config core.hooksPath script/githooks
+exec "$(git rev-parse --show-toplevel)/script/run-lint-test.sh"

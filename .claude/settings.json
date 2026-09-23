@@ -1,0 +1,58 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/script/hooks/bash-guard.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Bash(git push origin main)",
+      "Bash(git push origin main:*)",
+      "Bash(git push -u origin main)",
+      "Bash(git push --set-upstream origin main)",
+      "Bash(git push origin HEAD:main)",
+      "Bash(git push*HEAD:refs/heads/main*)",
+      "Bash(git push*refs/heads/main*)",
+      "Bash(git push*:main)",
+      "Bash(git push origin develop)",
+      "Bash(git push origin develop:*)",
+      "Bash(git push -u origin develop)",
+      "Bash(git push --set-upstream origin develop)",
+      "Bash(git push origin HEAD:develop)",
+      "Bash(git push*HEAD:refs/heads/develop*)",
+      "Bash(git push*refs/heads/develop*)",
+      "Bash(git push*:develop)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git push origin --force:*)",
+      "Bash(git push origin -f:*)",
+      "Bash(git push origin +*)",
+      "Bash(git push --no-verify:*)",
+      "Bash(git push*--no-verify*)",
+      "Bash(git commit --no-verify:*)",
+      "Bash(git commit*--no-verify*)",
+      "Bash(git commit -n:*)",
+      "Edit(.ai/project/scope.md)",
+      "Write(.ai/project/scope.md)",
+      "NotebookEdit(.ai/project/scope.md)",
+      "Edit(.ai/project/architecture.md)",
+      "Write(.ai/project/architecture.md)",
+      "NotebookEdit(.ai/project/architecture.md)",
+      "Edit(.ai/project/glossary.md)",
+      "Write(.ai/project/glossary.md)",
+      "NotebookEdit(.ai/project/glossary.md)",
+      "Edit(.ai/project/testing.md)",
+      "Write(.ai/project/testing.md)",
+      "NotebookEdit(.ai/project/testing.md)"
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+# 생성 파일이 설정과 어긋난 채 커밋되는 것을 막는다.
+#
+# 이 파일은 harness.toml 에서 생성된다. 직접 고치지 않는다.
+#
+# **왜 스테이징 기준인가.** 설정만 스테이징하고 생성 파일을 빼면 작업 트리는 일치해도
+# 커밋은 어긋난다. 받는 사람에게는 설정과 다른 훅·권한이 간다.
+#
+# 하네스를 찾지 못하면 통과시킨다 — 검사 도구가 없다는 이유로 커밋을 막으면
+# --no-verify 가 습관이 된다. 그때는 다른 층(수동 실행·리뷰)이 받는다.
+#
+# 활성화: git config core.hooksPath script/githooks
+set -u
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+for cli in "$root/.harness/bin/harness" "$root/bin/harness"; do
+  if [ -x "$cli" ]; then
+    "$cli" check --target "$root" --staged || exit 1
+    break
+  fi
+done
+
+exit 0
